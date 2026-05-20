@@ -13,6 +13,7 @@ from os import path, replace
 from shutil import copyfile
 from time import sleep
 from datetime import datetime
+from urllib.parse import quote
 from sys import argv, stdout
 import argparse, logging
 
@@ -121,7 +122,7 @@ def collect_keys(driver):
   logging.info("Getting individual keys from bundles")
   for gamekey in orders:
     gk = gamekey['gamekey']
-    contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gk}")
+    contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={quote(gk, safe='')}")
     items = contents[gk]["tpkd_dict"]["all_tpks"]
     logging.debug(items)
     logging.info("Sorting keys")
@@ -140,18 +141,24 @@ def collect_keys(driver):
   # humble bundle has a weird system where you have to "reveal" keys, and in order
   # to get the keys from the api calls they need to be revealed first
   for item in needs_reveal:
-    js = f'''var xhr = new XMLHttpRequest();
+    # Values are passed as execute_script arguments and URL-encoded in JS rather
+    # than baked into the source string, so a stray quote in API data can't break
+    # out of the literal and inject script into the authenticated session.
+    js = '''var xhr = new XMLHttpRequest();
     xhr.open('POST', 'https://www.humblebundle.com/humbler/redeemkey', false);
     xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
-    xhr.send('key={item['gamekey']}&keyindex={item['keyindex']}&keytype={item['machine_name']}');
+    xhr.send('key=' + encodeURIComponent(arguments[0]) +
+             '&keyindex=' + encodeURIComponent(arguments[1]) +
+             '&keytype=' + encodeURIComponent(arguments[2]));
     return xhr.response;'''
     logging.info("Attempting to reveal key")
     logging.debug(item)
-    response = parse_response(driver.execute_script(js))
+    response = parse_response(driver.execute_script(
+        js, item['gamekey'], item['keyindex'], item['machine_name']))
     if is_ok(response):
       logging.info("Key revealed")
       gk = item['gamekey']
-      contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gk}")
+      contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={quote(gk, safe='')}")
       all_tpks = contents[gk]["tpkd_dict"]["all_tpks"]
       # match on the keyindex field rather than trusting array order
       revealed = next((t for t in all_tpks if t.get("keyindex") == item["keyindex"]), None)
@@ -197,13 +204,14 @@ def redeem_keys(driver, try_redeem, used_keys, retry_rate_seconds, redeem_cooldo
       logging.info("Key existed, skipped")
       continue
 
-    js = f'''var xhr = new XMLHttpRequest();
+    js = '''var xhr = new XMLHttpRequest();
     xhr.open('POST', 'https://store.steampowered.com/account/ajaxregisterkey/', false);
     xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
-    xhr.send('product_key={key_val}&sessionid={sessionid}');
+    xhr.send('product_key=' + encodeURIComponent(arguments[0]) +
+             '&sessionid=' + encodeURIComponent(arguments[1]));
     return xhr.response;'''
     logging.info("Attempting to redeem key")
-    response = parse_response(driver.execute_script(js))
+    response = parse_response(driver.execute_script(js, key_val, sessionid))
     logging.debug(response)
 
     # success is True/"true"; otherwise inspect purchase_result_details.
