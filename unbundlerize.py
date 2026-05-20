@@ -1,207 +1,287 @@
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["selenium"]
+# ///
+
 from selenium.webdriver import Firefox as Browser
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
-from json import loads, dumps
-from os import path
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from json import loads, dumps, JSONDecodeError
+from os import path, replace
+from shutil import copyfile
 from time import sleep
 from datetime import datetime
-from sys import argv, exit, stdout
-import logging, getopt
+from sys import argv, stdout
+import argparse, logging
 
 # Please report back what worked for you (how many games in a row/how long it took) if you have the time!
 # Make an issue! https://github.com/gr8engineer2b/Humbler-Unbundler/issues
 
-# Defaults
-retry_rate_seconds = 60
-redeem_cooldown_minutes = 10
-loglevel = "INFO"
+USED_KEYS_FILE = "./.used_keys"
+BACKUP_FILE = USED_KEYS_FILE + ".bak"
+PAGE_LOAD_TIMEOUT_SECONDS = 10
+# Stop after this many back-to-back Steam rate-limit cooldowns instead of looping forever
+MAX_CONSECUTIVE_COOLDOWNS = 6
 
-#initialize log
-try:
-  opts, args = getopt.getopt(argv[1:],"hr:c:",["log="])
-except getopt.GetoptError:
-      print('unbundlerize.py -r <retry_rate_seconds> -c <redeem_cooldown_minutes> --log=(DEBUG|INFO|etc...)')
-for opt, arg in opts :
-  if opt == '-h':
-    print('unbundlerize.py -r <retry_rate_seconds> -c <redeem_cooldown_minutes> --log=(DEBUG|INFO|etc...)')
-    exit()
-  elif opt in ("--log="):
-    loglevel = arg
-  elif opt in ("-r"):
-    retry_rate_seconds = arg
-    if not retry_rate_seconds.isdigit() :
-      raise ValueError("Invalid retry rate (seconds)")
-    retry_rate_seconds = int(retry_rate_seconds)
-  elif opt in ("-c"):
-    redeem_cooldown_minutes = arg
-    if not redeem_cooldown_minutes.isdigit() :
-      raise ValueError("Invalid redeem cooldown (minutes)")
-    redeem_cooldown_minutes = int(redeem_cooldown_minutes)
 
-numeric_level = getattr(logging, loglevel.upper(), None)
-if not isinstance(numeric_level, int):
-    raise ValueError('Invalid log level: %s' % loglevel)
+def parse_args(args):
+  parser = argparse.ArgumentParser(
+      description="Bulk-redeem Humble Bundle Steam keys into your Steam account.")
+  parser.add_argument("-r", dest="retry_rate_seconds", type=int, default=60,
+                      help="seconds to wait between redeem attempts (default: 60)")
+  parser.add_argument("-c", dest="redeem_cooldown_minutes", type=int, default=10,
+                      help="minutes to wait when Steam rate-limits us (default: 10)")
+  parser.add_argument("--log", dest="loglevel", default="INFO", type=str.upper,
+                      choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                      help="logging level (default: INFO)")
+  return parser.parse_args(args)
 
-logname = f'Unbundler {datetime.now().strftime("%H%M %m%d%y")}.log'
-logging.basicConfig(filename=logname,
-                    filemode='a',
-                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-                    datefmt='%H:%M:%S',
-                    level=numeric_level)
-logging.getLogger().addHandler(logging.StreamHandler(stdout))
 
-logging.info("BEGIN!")
+def is_ok(response):
+  # Steam/Humble return success as either a bool or a string depending on endpoint
+  return response.get("success") in (True, "true")
 
-logging.info("Checking for used keys file")
-if path.exists("./.used_keys") :
+
+def parse_response(raw):
+  # The remote APIs return JSON; if we get HTML instead it usually means the
+  # session expired. Abort loudly so the caller's finally-block preserves progress.
+  try:
+    return loads(raw)
+  except (JSONDecodeError, TypeError):
+    snippet = raw[:200] if isinstance(raw, str) else raw
+    logging.error("Expected JSON but got something else (login expired?): %r", snippet)
+    raise RuntimeError("Non-JSON response from remote API; aborting to preserve progress")
+
+
+def fetch_json(driver, url):
+  # Round-about way to read an API response in the browser: it renders the JSON
+  # body inside a <pre> tag. Wait for it to render, falling back to the plain URL
+  # if view-source is blocked.
+  try:
+    driver.get(f"view-source:{url}")
+    pre = WebDriverWait(driver, PAGE_LOAD_TIMEOUT_SECONDS).until(
+        EC.presence_of_element_located((By.TAG_NAME, "pre")))
+    return loads(pre.text)
+  except (NoSuchElementException, TimeoutException):
+    driver.get(url)
+    pre = WebDriverWait(driver, PAGE_LOAD_TIMEOUT_SECONDS).until(
+        EC.presence_of_element_located((By.TAG_NAME, "pre")))
+    return loads(pre.text)
+
+
+def backup_used_keys():
+  if path.exists(USED_KEYS_FILE):
+    copyfile(USED_KEYS_FILE, BACKUP_FILE)
+    logging.info("Backed up used keys file to %s", BACKUP_FILE)
+
+
+def save_used_keys(used_keys):
+  # Atomic write: write to a temp file then replace, so an interrupted write can
+  # never leave the real file half-written / corrupt.
+  tmp = USED_KEYS_FILE + ".tmp"
+  with open(tmp, "w", encoding="utf8") as f:
+    f.write(dumps(used_keys))
+  replace(tmp, USED_KEYS_FILE)
+
+
+def load_used_keys():
+  if not path.exists(USED_KEYS_FILE):
+    logging.info("Used keys file does not exist, creating")
+    save_used_keys({})
+    logging.info("Successfully created used keys file")
+    return {}
   logging.info("Used keys file exists")
-  used_keys = loads(open("./.used_keys", "r", encoding="utf8").read())
-else :
-  logging.info("Used keys file does not exist, creating")
-  open("./.used_keys", "w", encoding="utf8")
-  logging.info("Successfully created used keys file")
-  used_keys = {}
+  with open(USED_KEYS_FILE, "r", encoding="utf8") as f:
+    text = f.read()
+  if not text.strip():
+    return {}
+  try:
+    return loads(text)
+  except JSONDecodeError:
+    quarantine = USED_KEYS_FILE + ".corrupt"
+    logging.error("Used keys file is corrupt; quarantining to %s and starting fresh", quarantine)
+    copyfile(USED_KEYS_FILE, quarantine)
+    return {}
 
-logging.info("Initializing Browser")
-driver = Browser()
 
-logging.info("Opening login page for humble bundle")
-driver.get("https://www.humblebundle.com/login")
-logging.info("Waiting for user input")
-input("Once logged in, Press Enter:")
+def collect_keys(driver):
+  logging.info("Opening login page for humble bundle")
+  driver.get("https://www.humblebundle.com/login")
+  logging.info("Waiting for user input")
+  input("Once logged in, Press Enter:")
 
-logging.info("Received input, getting owned bundles json")
-try :
-  driver.get("view-source:https://www.humblebundle.com/api/v1/user/order")
-  json = loads(driver.find_element(By.TAG_NAME,"pre").text)
-except NoSuchElementException as err :
-  driver.get("https://www.humblebundle.com/api/v1/user/order")
-  json = loads(driver.find_element(By.TAG_NAME,"pre").text)
+  logging.info("Received input, getting owned bundles json")
+  orders = fetch_json(driver, "https://www.humblebundle.com/api/v1/user/order")
+  logging.debug(orders)
 
-logging.debug(json)
-try_redeem = []
-needs_reveal = []
-logging.info("Getting individual keys from bundles")
-for gamekey in json :
-  try :
-    driver.get(f"view-source:https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gamekey['gamekey']}")
-    contents = loads(driver.find_element(By.TAG_NAME,"pre").text)
-  except NoSuchElementException as err :
-    driver.get(f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gamekey['gamekey']}")
-    contents = loads(driver.find_element(By.TAG_NAME,"pre").text)
+  try_redeem = []
+  needs_reveal = []
+  logging.info("Getting individual keys from bundles")
+  for gamekey in orders:
+    gk = gamekey['gamekey']
+    contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gk}")
+    items = contents[gk]["tpkd_dict"]["all_tpks"]
+    logging.debug(items)
+    logging.info("Sorting keys")
+    for item in items:
+      logging.debug(item)
+      if item["key_type"] != "steam":
+        logging.info("Key is not a steam key")
+        continue
+      if item.get("redeemed_key_val"):
+        logging.info("Key already revealed")
+        try_redeem.append(item)
+      else:
+        logging.info("Key not yet revealed")
+        needs_reveal.append(item)
 
-  items = contents[f"{gamekey['gamekey']}"]["tpkd_dict"]["all_tpks"]
-  logging.debug(items)
-  logging.info("Sorting keys")
-  for item in items :
+  # humble bundle has a weird system where you have to "reveal" keys, and in order
+  # to get the keys from the api calls they need to be revealed first
+  for item in needs_reveal:
+    js = f'''var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'https://www.humblebundle.com/humbler/redeemkey', false);
+    xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
+    xhr.send('key={item['gamekey']}&keyindex={item['keyindex']}&keytype={item['machine_name']}');
+    return xhr.response;'''
+    logging.info("Attempting to reveal key")
     logging.debug(item)
-    if item["key_type"] != "steam":
-      logging.info("Key is not a steam key")
+    response = parse_response(driver.execute_script(js))
+    if is_ok(response):
+      logging.info("Key revealed")
+      gk = item['gamekey']
+      contents = fetch_json(driver, f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={gk}")
+      all_tpks = contents[gk]["tpkd_dict"]["all_tpks"]
+      # match on the keyindex field rather than trusting array order
+      revealed = next((t for t in all_tpks if t.get("keyindex") == item["keyindex"]), None)
+      if revealed is None:
+        logging.warning("Could not locate revealed key by keyindex, skipping")
+        continue
+      logging.debug(revealed)
+      try_redeem.append(revealed)
+
+  return try_redeem
+
+
+def redeem_keys(driver, try_redeem, used_keys, retry_rate_seconds, redeem_cooldown_minutes):
+  logging.info("Opening login page for Steam")
+  driver.get("https://store.steampowered.com/login/")
+  logging.info("Waiting for user input")
+  input("Once logged in, Press Enter:")
+
+  logging.info("Received input, getting session id for redemption")
+  driver.get("https://store.steampowered.com/account/registerkey")
+  sessionid = driver.execute_script("return g_sessionID")
+  logging.debug(sessionid)
+  if not sessionid:
+    raise RuntimeError("Could not read Steam session id (g_sessionID). Are you logged in?")
+
+  # To handle recoverable circumstances we pop(0) entries off the top of the list.
+  # A for loop would skip items in a case like "too many requests from this ip".
+  logging.info("Entering redeem loop")
+  consecutive_cooldowns = 0
+  while try_redeem:
+    item = try_redeem[0]
+    logging.debug(item)
+    logging.info("Checking for key in .used_keys")
+    key_val = item.get('redeemed_key_val')
+    human_name = item.get('human_name', '<unknown>')
+    if not key_val:
+      try_redeem.pop(0)
+      logging.warning("Item has no redeemed key value, skipping: %s", human_name)
       continue
-    if item.get("redeemed_key_val") :
-      logging.info("Key already revealed")
-      try_redeem.append(item)
-    else :
-      logging.info("Key not yet revealed")
-      needs_reveal.append(item)
+    # we do not want to repeat redemption attempts because of steam limits
+    if used_keys.get(key_val):
+      try_redeem.pop(0)
+      logging.info("Key existed, skipped")
+      continue
 
-# humble bundle has a weird system where you have to "reveal" keys and in order 
-# to get the keys from the api calls they need to be revealed
-for item in needs_reveal :
-  # This is a round about way to do a post request in selenium
-  js = f'''var xhr = new XMLHttpRequest();
-  xhr.open('POST', 'https://www.humblebundle.com/humbler/redeemkey', false);
-  xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
-  xhr.send('key={item['gamekey']}&keyindex={item['keyindex']}&keytype={item['machine_name']}');
-  return xhr.response;'''
-  # this executes above
-  logging.info("Attempting to reveal key")
-  logging.debug(item)
-  response = loads(driver.execute_script(js))
-  if response["success"] == True or response["success"] == "true":
-    logging.info("Key revealed")
-    try :
-      driver.get(f"view-source:https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={item['gamekey']}")
-      contents = loads(driver.find_element(By.TAG_NAME,"pre").text)
-    except NoSuchElementException as err :
-      driver.get(f"https://www.humblebundle.com/api/v1/orders?all_tpkds=true&gamekeys={item['gamekey']}")
-      contents = loads(driver.find_element(By.TAG_NAME,"pre").text)
+    js = f'''var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'https://store.steampowered.com/account/ajaxregisterkey/', false);
+    xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
+    xhr.send('product_key={key_val}&sessionid={sessionid}');
+    return xhr.response;'''
+    logging.info("Attempting to redeem key")
+    response = parse_response(driver.execute_script(js))
+    logging.debug(response)
 
-    contents = loads(driver.find_element(By.TAG_NAME,"pre").text)
-    item = contents[f"{item['gamekey']}"]["tpkd_dict"]["all_tpks"][item['keyindex']]
-    logging.debug(item)
-    try_redeem.append(item)
+    # success is True/"true"; otherwise inspect purchase_result_details.
+    # In most cases we pop off the top of the list below.
+    if is_ok(response):
+      consecutive_cooldowns = 0
+      used_keys[key_val] = "successfully redeemed"
+      try_redeem.pop(0)
+      logging.info(f"Successfully redeemed {human_name}")
+      sleep(retry_rate_seconds)
+    elif response.get("purchase_result_details") == 15:
+      consecutive_cooldowns = 0
+      used_keys[key_val] = "owned by a different account"
+      try_redeem.pop(0)
+      logging.info(f"{human_name} is owned by a different account")
+      sleep(retry_rate_seconds)
+    elif response.get("purchase_result_details") == 9:
+      consecutive_cooldowns = 0
+      used_keys[key_val] = "already redeemed to this account"
+      try_redeem.pop(0)
+      logging.info(f"{human_name} is already redeemed to this account")
+      sleep(retry_rate_seconds)
+    elif response.get("purchase_result_details") == 24:
+      consecutive_cooldowns = 0
+      try_redeem.pop(0)
+      logging.info(f"You need another product before it is possible to redeem : {human_name}")
+      sleep(retry_rate_seconds)
+    elif response.get("purchase_result_details") == 53:
+      consecutive_cooldowns += 1
+      if consecutive_cooldowns > MAX_CONSECUTIVE_COOLDOWNS:
+        raise RuntimeError(
+            f"Steam still rate-limiting after {MAX_CONSECUTIVE_COOLDOWNS} cooldowns; "
+            "stopping to preserve progress")
+      logging.info(f"Steam is disallowing redeem due to too many requests, waiting for a while ({redeem_cooldown_minutes} min) and will continue...")
+      # occasionally write to file so as not to lose progress
+      logging.info("Writing keys to file")
+      save_used_keys(used_keys)
+      logging.info("Finished writing keys to file")
+      sleep(redeem_cooldown_minutes * 60)  # steam got angry, sleep for a number of minutes
+    else:
+      consecutive_cooldowns = 0
+      try_redeem.pop(0)
+      logging.warning(f"The following response was not handled {response}")
+      sleep(retry_rate_seconds)
 
-logging.info("Opening login page for Steam")
-driver.get("https://steamcommunity.com/login/home/")
-logging.info("Waiting for user input")
-input("Once logged in, Press Enter:")
 
-logging.info("Received input, getting session id for redemption")
-driver.get(f"https://store.steampowered.com/account/registerkey")
-sessionid = driver.execute_script("return g_sessionID")
-logging.debug(sessionid)
+def main():
+  args = parse_args(argv[1:])
 
-# To handle errors that are recoverable circumstances we pop(0) entries off the top of the list
-# For loops would skip in a case like "too many requests from this ip"
-logging.info("Entering redeem loop")
-while try_redeem :
-  # set item
-  item = try_redeem[0]
-  # we do not want to repeat redemption attempts because of steam limits
-  logging.debug(item)
-  logging.info("Checking for key in .used_keys")
-  if used_keys.get(f"{item['redeemed_key_val']}") :
-    try_redeem.pop(0)
-    logging.info("Key existed, skipped")
-    continue
+  logname = datetime.now().strftime("unbundler_%Y%m%d_%H%M%S.log")
+  logging.basicConfig(filename=logname,
+                      filemode='a',
+                      format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                      datefmt='%H:%M:%S',
+                      level=getattr(logging, args.loglevel))
+  logging.getLogger().addHandler(logging.StreamHandler(stdout))
 
-  # This is a round about way to do a post request in selenium
-  js = f'''var xhr = new XMLHttpRequest();
-  xhr.open('POST', 'https://store.steampowered.com/account/ajaxregisterkey/', false);
-  xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
-  xhr.send('product_key={item['redeemed_key_val']}&sessionid={sessionid}');
-  return xhr.response;'''
-  # this executes above
-  logging.info("Attempting to redeem key")
-  logging.debug(item)
-  response = loads(driver.execute_script(js))
-  logging.debug(response)
+  logging.info("BEGIN!")
 
-  # response 1 (or true) is success / 2 for some kind of failure 
-  # In most cases we want to pop off the top of the list below
-  if response["success"] == True or response["success"] == "true":
-    used_keys[f"{item['redeemed_key_val']}"] = "successfully redeemed"
-    try_redeem.pop(0)
-    logging.info(f"Successfully redeemed {item['human_name']}")
-    sleep(retry_rate_seconds) # sleep for a number of seconds
-  elif response.get("purchase_result_details") == 15:
-    used_keys[f"{item['redeemed_key_val']}"] = "owned by a different account"
-    try_redeem.pop(0)
-    logging.info(f"{item['human_name']} is owned by a different account")
-    sleep(retry_rate_seconds) # sleep for a number of seconds
-  elif response.get("purchase_result_details") == 9:
-    used_keys[f"{item['redeemed_key_val']}"] = "already redeemed to this account"
-    try_redeem.pop(0)
-    logging.info(f"{item['human_name']} is already redeemed to this account")
-    sleep(retry_rate_seconds) # sleep for a number of seconds
-  elif response.get("purchase_result_details") == 24:
-    try_redeem.pop(0)
-    logging.info(f"You need another product before it is possible to redeem : {item['human_name']}")
-    sleep(retry_rate_seconds) # sleep for a number of seconds
-  elif response.get("purchase_result_details") == 53:
-    logging.info(f"Steam is disallowing redeem due to too many requests, waiting for a while ({redeem_cooldown_minutes} min) and will continue...")
-    # occasionally write to file so as not to lose progress
+  logging.info("Checking for used keys file")
+  used_keys = load_used_keys()
+  # back up the last-known-good file before we touch anything
+  backup_used_keys()
+
+  logging.info("Initializing Browser")
+  driver = Browser()
+  # Ensure progress is always saved and the browser always closes, even on error
+  try:
+    try_redeem = collect_keys(driver)
+    redeem_keys(driver, try_redeem, used_keys, args.retry_rate_seconds, args.redeem_cooldown_minutes)
+  finally:
+    logging.info("Backing up before final save")
+    backup_used_keys()
     logging.info("Writing keys to file")
-    open("./.used_keys", "w", encoding="utf8").write(dumps(used_keys))
-    logging.info("Finished writing keys to file")
-    sleep(redeem_cooldown_minutes*60) # steam got angry, sleep for a number of minutes
-  else :
-    try_redeem.pop(0)
-    logging.warning(f"The following response was not handled {response}")
-    sleep(retry_rate_seconds) # sleep for a number of seconds
+    save_used_keys(used_keys)
+    driver.quit()
+  logging.info("ALL DONE!")
 
-# cleanup
-open("./.used_keys", "w", encoding="utf8").write(dumps(used_keys))
-driver.close()
-logging.info("ALL DONE!")
+
+if __name__ == "__main__":
+  main()
