@@ -66,7 +66,7 @@ This is a tool for automatically redeeming humble bundle steam keys to steam. Wi
 
 ## Settings
 
-defaults are `retry_rate_seconds = 60 | redeem_cooldown_minutes = 10 | loglevel = INFO`
+defaults are `retry_rate_seconds = 90 | redeem_cooldown_minutes = 10 | loglevel = INFO`
 
 ```
 uv run unbundlerize.py -r <retry_rate_seconds> -c <redeem_cooldown_minutes> --log {DEBUG,INFO,WARNING,ERROR,CRITICAL}
